@@ -27,10 +27,11 @@ function escInto(parts, s, a, b) {
   if (b > start) parts.push(s.slice(start, b));
 }
 
+const ESC_RE = /[&<>"']/g;
+const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
 function escStr(s) {
-  const parts = [];
-  escInto(parts, s, 0, s.length);
-  return parts.join('');
+  return s.replace(ESC_RE, (ch) => ESC_MAP[ch]);
 }
 
 function slugify(s) {
@@ -287,7 +288,8 @@ function resolvePath(segs, scopes) {
   let found = false;
   for (let s = scopes.length - 1; s >= 0; s--) {
     const sc = scopes[s];
-    if (Object.prototype.hasOwnProperty.call(sc, segs[0])) { v = sc[segs[0]]; found = true; break; }
+    v = sc[segs[0]];
+    if (v !== undefined) { found = true; break; }
   }
   if (!found) return undefined;
   for (let i = 1; i < segs.length; i++) {
@@ -319,7 +321,87 @@ function stringifyValue(v) {
   return '';
 }
 
-function renderNodes(nodes, scopes, tpls, out, depth) {
+// Static analysis: does a template's rendering depend only on case-global
+// values (site, tags, recent)? If so, its output is identical on every page
+// of the case and can be cached. Returns {ok, edges} where edges = longest
+// include chain below the template (for the depth-8 include limit).
+const STATIC_GLOBALS = new Set(['site', 'tags', 'recent']);
+function analyzeStatic(nodes, tpls, statics, visiting, memo) {
+  let edges = 0;
+  for (let n = 0; n < nodes.length; n++) {
+    const nd = nodes[n];
+    if (nd.t === 0) continue;
+    if (nd.t === 1 || nd.t === 2) {
+      if (!statics.has(nd.p[0])) return { ok: false, edges: 0 };
+      continue;
+    }
+    if (nd.t === 3) {
+      if (!statics.has(nd.p[0])) return { ok: false, edges: 0 };
+      const inner = new Set(statics);
+      inner.add(nd.v);
+      inner.add('loop');
+      const r = analyzeStatic(nd.body, tpls, inner, visiting, memo);
+      if (!r.ok) return { ok: false, edges: 0 };
+      if (r.edges > edges) edges = r.edges;
+      continue;
+    }
+    if (nd.t === 4) {
+      if (!statics.has(nd.p[0])) return { ok: false, edges: 0 };
+      const r1 = analyzeStatic(nd.then, tpls, statics, visiting, memo);
+      if (!r1.ok) return { ok: false, edges: 0 };
+      if (r1.edges > edges) edges = r1.edges;
+      if (nd.els) {
+        const r2 = analyzeStatic(nd.els, tpls, statics, visiting, memo);
+        if (!r2.ok) return { ok: false, edges: 0 };
+        if (r2.edges > edges) edges = r2.edges;
+      }
+      continue;
+    }
+    if (nd.t === 5) {
+      const sub = tpls.get(nd.name);
+      if (!sub) continue;
+      if (visiting.has(nd.name)) return { ok: false, edges: 0 };
+      let r = memo.get(nd.name);
+      if (!r) {
+        visiting.add(nd.name);
+        r = analyzeStatic(sub, tpls, STATIC_GLOBALS, visiting, memo);
+        visiting.delete(nd.name);
+        memo.set(nd.name, r);
+      }
+      if (!r.ok) return { ok: false, edges: 0 };
+      if (r.edges + 1 > edges) edges = r.edges + 1;
+      continue;
+    }
+  }
+  return { ok: true, edges };
+}
+
+function annotateStaticIncludes(tpls) {
+  const memo = new Map();
+  for (const nodes of tpls.values()) {
+    const walk = (list) => {
+      for (const nd of list) {
+        if (nd.t === 3) walk(nd.body);
+        else if (nd.t === 4) { walk(nd.then); if (nd.els) walk(nd.els); }
+        else if (nd.t === 5) {
+          const sub = tpls.get(nd.name);
+          if (sub) {
+            let r = memo.get(nd.name);
+            if (!r) {
+              r = analyzeStatic(sub, tpls, STATIC_GLOBALS, new Set([nd.name]), memo);
+              memo.set(nd.name, r);
+            }
+            nd.cache = r.ok;
+            nd.cedges = r.edges;
+          }
+        }
+      }
+    };
+    walk(nodes);
+  }
+}
+
+function renderNodes(nodes, scopes, tpls, out, depth, cache) {
   for (let n = 0; n < nodes.length; n++) {
     const nd = nodes[n];
     if (nd.t === 0) { out.push(nd.s); continue; }
@@ -332,7 +414,7 @@ function renderNodes(nodes, scopes, tpls, out, depth) {
     if (nd.t === 3) {
       const arr = resolvePath(nd.p, scopes);
       if (!Array.isArray(arr) || arr.length === 0) continue;
-      const scope = {};
+      const scope = Object.create(null);
       const loop = { index: 0, first: false, last: false, length: arr.length };
       scope.loop = loop;
       scopes.push(scope);
@@ -342,29 +424,43 @@ function renderNodes(nodes, scopes, tpls, out, depth) {
         loop.last = i === arr.length - 1;
         scope[nd.v] = arr[i];
         scope.loop = loop;
-        renderNodes(nd.body, scopes, tpls, out, depth);
+        renderNodes(nd.body, scopes, tpls, out, depth, cache);
       }
       scopes.pop();
       continue;
     }
     if (nd.t === 4) {
       const tv = truthy(resolvePath(nd.p, scopes));
-      if ((tv && !nd.neg) || (!tv && nd.neg)) renderNodes(nd.then, scopes, tpls, out, depth);
-      else if (nd.els) renderNodes(nd.els, scopes, tpls, out, depth);
+      if ((tv && !nd.neg) || (!tv && nd.neg)) renderNodes(nd.then, scopes, tpls, out, depth, cache);
+      else if (nd.els) renderNodes(nd.els, scopes, tpls, out, depth, cache);
       continue;
     }
     if (nd.t === 5) {
       if (depth >= 8) continue;
       const sub = tpls.get(nd.name);
-      if (sub) renderNodes(sub, scopes, tpls, out, depth + 1);
+      if (!sub) continue;
+      if (nd.cache && depth + 1 + nd.cedges < 8) {
+        let s = cache.get(nd.name);
+        if (s === undefined) {
+          const tmp = [];
+          renderNodes(sub, scopes, tpls, tmp, depth + 1, cache);
+          s = tmp.join('');
+          cache.set(nd.name, s);
+        }
+        out.push(s);
+        continue;
+      }
+      renderNodes(sub, scopes, tpls, out, depth + 1, cache);
       continue;
     }
   }
 }
 
-function renderTemplate(nodes, ctx, tpls) {
+function renderTemplate(nodes, ctx, tpls, cache) {
   const out = [];
-  renderNodes(nodes, [ctx], tpls, out, 0);
+  const root = Object.create(null);
+  Object.assign(root, ctx);
+  renderNodes(nodes, [root], tpls, out, 0, cache);
   return out.join('');
 }
 
@@ -397,82 +493,87 @@ function findEmClose(s, from, n) {
   return -1;
 }
 
+function pushEscaped(out, s, a, b) {
+  if (b <= a) return;
+  out.push(s.slice(a, b).replace(ESC_RE, (ch) => ESC_MAP[ch]));
+}
+
+const MARK_RE = /[\\`*\[]/g;
+
 function renderInline(s, a, b, ctx, out) {
   let i = a;
   let plain = a;
-  const pushPlain = (to) => { if (to > plain) escInto(out, s, plain, to); };
   while (i < b) {
-    const c = s.charCodeAt(i);
+    MARK_RE.lastIndex = i;
+    const m = MARK_RE.exec(s);
+    const ni = m && m.index < b ? m.index : -1;
+    if (ni === -1) break;
+    const c = s.charCodeAt(ni);
     if (c === 92) {
-      const nx = i + 1 < b ? s[i + 1] : '';
+      const nx = ni + 1 < b ? s[ni + 1] : '';
       if (nx !== '' && ESCAPABLE.has(nx)) {
-        pushPlain(i);
+        pushEscaped(out, s, plain, ni);
         out.push(nx === '&' ? '&amp;' : nx === '<' ? '&lt;' : nx === '>' ? '&gt;' : nx === '"' ? '&quot;' : nx === "'" ? '&#39;' : nx);
-        i += 2;
+        i = ni + 2;
         plain = i;
         continue;
       }
-      i++;
+      i = ni + 1;
       continue;
     }
     if (c === 96) {
-      let j = i + 1;
-      while (j < b && s.charCodeAt(j) !== 96) j++;
-      if (j < b && j > i + 1) {
-        pushPlain(i);
+      const j = s.indexOf('`', ni + 1);
+      if (j !== -1 && j < b && j > ni + 1) {
+        pushEscaped(out, s, plain, ni);
         out.push('<code>');
-        escInto(out, s, i + 1, j);
+        pushEscaped(out, s, ni + 1, j);
         out.push('</code>');
         i = j + 1;
         plain = i;
         continue;
       }
-      i++;
+      i = ni + 1;
       continue;
     }
     if (c === 42) {
-      if (i + 1 < b && s.charCodeAt(i + 1) === 42) {
-        const close = findStrongClose(s, i + 2, b);
-        if (close !== -1 && close !== i + 2) {
-          pushPlain(i);
+      if (ni + 1 < b && s.charCodeAt(ni + 1) === 42) {
+        const close = findStrongClose(s, ni + 2, b);
+        if (close !== -1 && close !== ni + 2) {
+          pushEscaped(out, s, plain, ni);
           out.push('<strong>');
-          renderInline(s, i + 2, close, ctx, out);
+          renderInline(s, ni + 2, close, ctx, out);
           out.push('</strong>');
           i = close + 2;
           plain = i;
           continue;
         }
-        i += 2;
+        i = ni + 2;
         continue;
       }
-      const close = findEmClose(s, i + 1, b);
+      const close = findEmClose(s, ni + 1, b);
       if (close !== -1) {
-        pushPlain(i);
+        pushEscaped(out, s, plain, ni);
         out.push('<em>');
-        renderInline(s, i + 1, close, ctx, out);
+        renderInline(s, ni + 1, close, ctx, out);
         out.push('</em>');
         i = close + 1;
         plain = i;
         continue;
       }
-      i++;
+      i = ni + 1;
       continue;
     }
-    if (c === 91) {
-      const res = tryLink(s, i, b, ctx);
-      if (res) {
-        pushPlain(i);
-        out.push(res.html);
-        i = res.next;
-        plain = i;
-        continue;
-      }
-      i++;
+    const res = tryLink(s, ni, b, ctx);
+    if (res) {
+      pushEscaped(out, s, plain, ni);
+      out.push(res.html);
+      i = res.next;
+      plain = i;
       continue;
     }
-    i++;
+    i = ni + 1;
   }
-  pushPlain(b);
+  pushEscaped(out, s, plain, b);
 }
 
 function tryLink(s, i, n, ctx) {
@@ -503,19 +604,45 @@ function tryLink(s, i, n, ctx) {
 // ---------- markdown blocks ----------
 
 function isBlank(line) {
-  return line.trim() === '';
+  for (let i = 0; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+
+function trimLine(line) {
+  let a = 0, b = line.length;
+  while (a < b && (line.charCodeAt(a) === 32 || line.charCodeAt(a) === 9)) a++;
+  while (b > a && (line.charCodeAt(b - 1) === 32 || line.charCodeAt(b - 1) === 9)) b--;
+  return a === 0 && b === line.length ? line : line.slice(a, b);
 }
 
 function fenceOpen(line) {
   if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
-  const rest = line.slice(3);
-  const m = /^([A-Za-z0-9_+\-]*)[ \t]*$/.exec(rest);
-  if (!m) return null;
-  return m[1];
+  let i = 3;
+  const start = i;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) i++;
+    else break;
+  }
+  const lang = line.slice(start, i);
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return null;
+    i++;
+  }
+  return lang;
 }
 
 function isFenceClose(line) {
-  return /^```[ \t]*$/.test(line);
+  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
+  for (let i = 3; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
 }
 
 function headingMatch(line) {
@@ -525,46 +652,63 @@ function headingMatch(line) {
   if (h >= line.length) return null;
   const c = line.charCodeAt(h);
   if (c !== 32 && c !== 9) return null;
-  const text = line.slice(h).replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
+  const text = trimLine(line.slice(h));
   if (text === '') return null;
   return { level: h, text };
 }
 
 function isHr(line) {
-  return /^---[ \t]*$/.test(line) || /^\*\*\*[ \t]*$/.test(line);
+  const c0 = line.charCodeAt(0);
+  if (c0 !== 45 && c0 !== 42) return false;
+  if (line.charCodeAt(1) !== c0 || line.charCodeAt(2) !== c0) return false;
+  for (let i = 3; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
 }
 
 function listMarker(line) {
-  if (line.startsWith('- ') || line.startsWith('* ')) {
-    return { ordered: false, num: 0, text: line.slice(2).trim() };
+  if (line.charCodeAt(0) === 45 && line.charCodeAt(1) === 32) {
+    return { ordered: false, num: 0, text: trimLine(line.slice(2)) };
   }
-  const m = /^(\d+)\. (.*)$/.exec(line);
-  if (m) return { ordered: true, num: parseInt(m[1], 10), text: m[2].trim() };
+  if (line.charCodeAt(0) === 42 && line.charCodeAt(1) === 32) {
+    return { ordered: false, num: 0, text: trimLine(line.slice(2)) };
+  }
+  let i = 0;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if (c >= 48 && c <= 57) i++;
+    else break;
+  }
+  if (i > 0 && line.charCodeAt(i) === 46 && line.charCodeAt(i + 1) === 32) {
+    return { ordered: true, num: parseInt(line.slice(0, i), 10), text: trimLine(line.slice(i + 2)) };
+  }
   return null;
 }
 
-function countWords(body) {
+function countWordsLines(lines, start) {
   let n = 0;
-  let inWord = false;
-  for (let i = 0; i < body.length; i++) {
-    const c = body.charCodeAt(i);
-    const ws = c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12;
-    if (ws) inWord = false;
-    else if (!inWord) { inWord = true; n++; }
+  for (let li = start; li < lines.length; li++) {
+    const body = lines[li];
+    let inWord = false;
+    for (let i = 0; i < body.length; i++) {
+      if (body.charCodeAt(i) <= 32) inWord = false;
+      else if (!inWord) { inWord = true; n++; }
+    }
   }
   return n;
 }
 
-function renderMarkdown(body, ctx) {
-  const lines = body.split('\n');
+function renderMarkdown(lines, startIdx, ctx) {
   const out = [];
   const toc = [];
   const headingIds = new Map();
   let excerpt = '';
   let excerptDone = false;
-  let i = 0;
+  let i = startIdx;
   const L = lines.length;
-  const words = countWords(body);
+  const words = countWordsLines(lines, startIdx);
   while (i < L) {
     const line = lines[i];
     if (isBlank(line)) { i++; continue; }
@@ -607,7 +751,7 @@ function renderMarkdown(body, ctx) {
       while (i < L && lines[i].charCodeAt(0) === 62) {
         let t = lines[i].slice(1);
         if (t.charCodeAt(0) === 32) t = t.slice(1);
-        t = t.trim();
+        t = trimLine(t);
         if (t !== '') qlines.push(t);
         i++;
       }
@@ -629,8 +773,8 @@ function renderMarkdown(body, ctx) {
         const l2 = lines[i];
         const m2 = listMarker(l2);
         if (m2 && m2.ordered === ordered) { items.push(m2.text); i++; continue; }
-        if (l2.length >= 2 && l2.charCodeAt(0) === 32 && l2.charCodeAt(1) === 32 && l2.trim() !== '') {
-          items[items.length - 1] += '\n' + l2.trim();
+        if (l2.length >= 2 && l2.charCodeAt(0) === 32 && l2.charCodeAt(1) === 32 && !isBlank(l2)) {
+          items[items.length - 1] += '\n' + trimLine(l2);
           i++;
           continue;
         }
@@ -651,7 +795,7 @@ function renderMarkdown(body, ctx) {
       const l2 = lines[i];
       if (isBlank(l2)) break;
       if (fenceOpen(l2) !== null || headingMatch(l2) || isHr(l2)) break;
-      plines.push(l2.trim());
+      plines.push(trimLine(l2));
       i++;
     }
     const ptext = plines.join('\n');
@@ -698,6 +842,8 @@ export function run(input) {
     if (r.error) report.push('template "' + name + '": ' + r.error);
     else tpls.set(name, r.nodes);
   }
+  annotateStaticIncludes(tpls);
+  const tplCache = new Map();
 
   const files = (input.files || []).slice().sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const docs = [];
@@ -709,7 +855,8 @@ export function run(input) {
   for (const f of files) {
     const path = f.path;
     if (!path.endsWith('.md')) { statics.push(f); staticSet.add(path); continue; }
-    const content = String(f.content).replace(/\r\n?/g, '\n');
+    const rawContent = String(f.content);
+    const content = rawContent.indexOf('\r') === -1 ? rawContent : rawContent.replace(/\r\n?/g, '\n');
     const lines = content.split('\n');
     if (lines[0] !== '---') { report.push('refused ' + path + ': no front matter'); continue; }
     let close = -1;
@@ -737,8 +884,7 @@ export function run(input) {
     used.add(slug);
     const url = base + '/' + (dir === '' ? '' : dir + '/') + slug + '/';
     const outPath = (dir === '' ? '' : dir + '/') + slug + '/index.html';
-    const body = lines.slice(close + 1).join('\n');
-    const doc = { path, isPost, dir, slug, url, outPath, layoutName, fm, body };
+    const doc = { path, isPost, dir, slug, url, outPath, layoutName, fm, lines, close };
     docs.push(doc);
     pageBySource.set(path, doc);
   }
@@ -759,7 +905,7 @@ export function run(input) {
 
   for (const doc of docs) {
     const ctx = { resolveLink: (t) => resolveLink(t, doc.path) };
-    const md = renderMarkdown(doc.body, ctx);
+    const md = renderMarkdown(doc.lines, doc.close + 1, ctx);
     doc.content = md.html;
     doc.excerpt = md.excerpt;
     doc.toc = md.toc;
@@ -852,7 +998,7 @@ export function run(input) {
   let pageCount = 0, postCount = 0;
   for (const doc of docs) {
     const nodes = tpls.get(doc.layoutName);
-    out[doc.outPath] = renderTemplate(nodes, { site, tags: tagsCtx, recent, page: doc.page }, tpls);
+    out[doc.outPath] = renderTemplate(nodes, { site, tags: tagsCtx, recent, page: doc.page }, tpls, tplCache);
     if (doc.isPost) postCount++; else pageCount++;
   }
 
@@ -870,19 +1016,19 @@ export function run(input) {
         older_url: p === totalPages ? '' : base + '/page/' + (p + 1) + '/',
       };
       const path = p === 1 ? 'index.html' : 'page/' + p + '/index.html';
-      out[path] = renderTemplate(nodes, { site, tags: tagsCtx, recent, posts: slice, pager }, tpls);
+      out[path] = renderTemplate(nodes, { site, tags: tagsCtx, recent, posts: slice, pager }, tpls, tplCache);
     }
   }
   if (tpls.has('tag')) {
     const nodes = tpls.get('tag');
     for (const t of tags) {
       const tagObj = { name: t.name, slug: t.slug, url: t.url, count: t.count, posts: t.posts.map(cardOf) };
-      out['tags/' + t.slug + '/index.html'] = renderTemplate(nodes, { site, tags: tagsCtx, recent, tag: tagObj }, tpls);
+      out['tags/' + t.slug + '/index.html'] = renderTemplate(nodes, { site, tags: tagsCtx, recent, tag: tagObj }, tpls, tplCache);
       tagPageCount++;
     }
   }
   if (tpls.has('tags')) {
-    out['tags/index.html'] = renderTemplate(tpls.get('tags'), { site, tags: tagsCtx, recent }, tpls);
+    out['tags/index.html'] = renderTemplate(tpls.get('tags'), { site, tags: tagsCtx, recent }, tpls, tplCache);
   }
   for (const st of statics) {
     if (Object.prototype.hasOwnProperty.call(out, st.path)) {
